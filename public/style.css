@@ -65,6 +65,28 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .rolltab .ulen { display: block; font-size: 11px; color: #2e7d32; }
 .rolltab .idle { display: block; font-size: 11px; color: #999; }
 .rolltab.active .ulen, .rolltab.active .idle { color: #d7ecff; }
+.rolltab .cutlen { display: block; font-size: 11px; color: #4e342e; font-weight: 600; }
+.rolltab.active .cutlen { color: #ffe0b2; }
+
+#cutBar {
+  display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 6px 12px 0; padding: 7px 12px;
+  background: #fff; border: 1px solid #b0bec5; border-radius: 6px; font-size: 13px;
+}
+#cutBar.show { display: flex; }
+#cutBar .cut-label { font-weight: 600; color: #37474f; }
+#cutBar .cut-mm { color: #4e342e; }
+#cutBar .dim { color: #888; }
+#cutBar .cut-chips { display: contents; }
+#cutBar .cutchip {
+  display: inline-block; margin: 1px 2px; padding: 1px 8px;
+  background: #eceff1; border: 1px solid #90a4ae; border-radius: 10px;
+  font-size: 12px; color: #37474f;
+}
+#cutBar .cut-input { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+#cutBar .cut-input input { width: 92px; padding: 3px 6px; }
+#cutBar .hint { flex-basis: 100%; margin: 0; }
+.cut-tag { color: #4e342e; font-weight: 600; }
 
 #workspace { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #toolbar {

@@ -44,7 +44,8 @@ function recompute(jobId, touch) {
     .get(jobId);
   const rows = db
     .prepare(
-      `SELECT r.id, MAX(CASE WHEN p.placed = 1 THEN p.y + t.bh END) AS ml
+      `SELECT r.id, r.cut_length AS cl,
+              MAX(CASE WHEN p.placed = 1 THEN p.y + t.bh END) AS ml
        FROM rolls r
        LEFT JOIN placements p ON p.roll_id = r.id
        LEFT JOIN piece_types t ON t.id = p.piece_type_id
@@ -56,7 +57,8 @@ function recompute(jobId, touch) {
   let totalUsed = 0;
   const updRoll = db.prepare('UPDATE rolls SET used = ?, used_length = ? WHERE id = ?');
   for (const r of rows) {
-    const usedLength = r.ml == null ? 0 : r.ml;
+    // 已裁卷段必然已经消耗：占用长度取已排件末端与已确认切线的较大者
+    const usedLength = Math.max(r.ml == null ? 0 : r.ml, r.cl || 0);
     updRoll.run(usedLength > 0 ? 1 : 0, usedLength, r.id);
     totalUsed += usedLength;
   }
@@ -81,7 +83,14 @@ function jobState(jobId) {
     length: r.length,
     used: !!r.used,
     usedLength: r.used_length,
+    cutLength: r.cut_length || 0, // 已确认裁剪切线 mm（该线之前的卷段已裁）
   }));
+  const rollByIdForCut = new Map(rolls.map((r) => [r.id, r.cut_length || 0]));
+  /** 某件在其所在卷是否已裁：已排且整体位于切线之前（可接触切线） */
+  const isCutPlacement = (p) =>
+    !!p.placed && p.roll_id != null
+      ? rollByIdForCut.get(p.roll_id) > 0 && p.y + p.bh <= rollByIdForCut.get(p.roll_id)
+      : false;
   const firstRoll = rolls[0] || null;
   return {
     job: {
@@ -126,6 +135,7 @@ function jobState(jobId) {
       rotation: p.rotation,
       placed: !!p.placed,
       locked: !!p.locked,
+      cut: isCutPlacement(p), // 已随切线裁下（卷号/位置/方向/必用卷均不可再改）
       allowRotate: !!p.allow_rotate,
       bw: p.bw,
       bh: p.bh,
@@ -140,6 +150,30 @@ function jobState(jobId) {
         rollId: p.required_roll_id,
         reason: p.unplaced_reason || null,
       })),
+    cutting: buildCutting(rollList, placements),
+  };
+}
+
+/** 组装按卷裁剪进度：各卷切线、本卷已裁件、汇总计数 */
+function buildCutting(rollList, placements) {
+  const byRoll = rollList.map((r) => {
+    const cutPcs = placements
+      .filter((p) => p.placed && p.roll_id === r.id && p.y + p.bh <= r.cutLength)
+      .map((p) => ({ id: p.id, name: p.name, seq: p.seq }));
+    return {
+      rollId: r.id,
+      seq: r.seq,
+      label: r.label,
+      length: r.length,
+      cutLine: r.cutLength,
+      cutCount: cutPcs.length,
+      cutPieces: cutPcs,
+    };
+  });
+  return {
+    rolls: byRoll,
+    cutCount: byRoll.reduce((n, r) => n + r.cutCount, 0),
+    totalCount: placements.length,
   };
 }
 
@@ -218,16 +252,26 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
   const { job, rolls, defects, types, placements } = full;
   const rollIndexById = new Map(rolls.map((r, i) => [r.id, i]));
   const typeById = new Map(types.map((t) => [t.id, t]));
+  const cutLenById = new Map(rolls.map((r) => [r.id, r.cut_length || 0]));
 
-  const locked = placements.filter((p) => p.placed && p.locked);
-  const rest = placements.filter((p) => !(p.placed && p.locked));
+  /** 已排且整体位于本卷切线之前（含接触切线）的件为已裁件 */
+  const isCut = (p) =>
+    p.placed && p.roll_id != null && p.y + p.bh <= cutLenById.get(p.roll_id);
+
+  // 已裁件与锁定件一律固定（已裁件不可回退：卷号/位置/方向不得再改）
+  const locked = placements.filter((p) => p.placed && (p.locked || isCut(p)));
+  const rest = placements.filter((p) => !(p.placed && (p.locked || isCut(p))));
 
   const result = optimizeRolls({
     rolls: rolls.map((r) => ({
       label: r.label,
       W: r.width,
       L: r.length,
-      defects: defects.filter((d) => d.roll_id === r.id),
+      defects: [
+        ...defects.filter((d) => d.roll_id === r.id),
+        // 已裁卷段（切线之前）对未裁件是整幅障碍：未裁件只能位于切线之后
+        ...((r.cut_length || 0) > 0 ? [{ x: 0, y: 0, w: r.width, h: r.cut_length }] : []),
+      ],
     })),
     locked: locked.map((p) => {
       const t = typeById.get(p.piece_type_id);
@@ -269,7 +313,7 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
   );
   const tx = db.transaction(() => {
     for (const pl of result.placements) {
-      if (lockedIds.has(pl.key)) continue; // 锁定件保持不动（含卷号与位置）
+      if (lockedIds.has(pl.key)) continue; // 锁定件/已裁件保持不动（含卷号与位置）
       upd.run(rolls[pl.rollIndex].id, pl.x, pl.y, pl.rotation, pl.key);
     }
     for (const [key, reason] of reasonById) {
@@ -304,6 +348,17 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   const placement = placements.find((p) => p.id === pid);
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
   const label = `裁片「${placement.name}#${placement.seq}」`;
+
+  // 已裁件不可回退：卷号、位置、方向均不得再改
+  if (placement.placed && placement.roll_id != null) {
+    const cutLine = rollById.get(placement.roll_id)?.cut_length || 0;
+    if (cutLine > 0 && placement.y + placement.bh <= cutLine) {
+      return res.status(409).json({
+        error: `${label}已随卷「${rollById.get(placement.roll_id).label}」切线 ${cutLine}mm 裁下，卷号、位置与方向不可再修改，也不能移回未排区`,
+        conflicts: [`卷「${rollById.get(placement.roll_id).label}」已裁段 0~${cutLine}mm`],
+      });
+    }
+  }
 
   if (placement.locked) {
     return res.status(409).json({ error: `${label}已锁定，请先解锁再移动`, conflicts: [label] });
@@ -368,6 +423,17 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
       conflicts: [label],
     });
   }
+  // 目标卷的已裁段不可再放未裁件：件整体必须位于切线之后（边可接触切线）
+  const targetCut = targetRoll.cut_length || 0;
+  if (targetCut > 0 && y < targetCut) {
+    const straddles = y + h > targetCut;
+    return res.status(409).json({
+      error: straddles
+        ? `${label}移动后压在卷「${targetRoll.label}」切线 ${targetCut}mm 上（切线穿过裁片），未裁件必须整体位于切线之后（下沿 y≥${targetCut}mm），已保留原方案`
+        : `${label}不能放入卷「${targetRoll.label}」已裁段（该卷切线 ${targetCut}mm，已裁段不可回退），未裁件下沿须满足 y≥${targetCut}mm，已保留原方案`,
+      conflicts: [`卷「${targetRoll.label}」已裁段 0~${targetCut}mm`],
+    });
+  }
 
   const type = types.find((t) => t.id === placement.piece_type_id);
   const verts = JSON.parse(type.vertices);
@@ -417,10 +483,26 @@ app.post('/api/jobs/:id/placements/:pid/lock', (req, res) => {
   res.json(jobState(jobId));
 });
 
-/** 移回未排区（同时解除锁定；保留必用卷约束） */
+/** 移回未排区（同时解除锁定；保留必用卷约束；已裁件不可回退） */
 app.post('/api/jobs/:id/placements/:pid/unplace', (req, res) => {
   const jobId = Number(req.params.id);
   const pid = Number(req.params.pid);
+  const p = db
+    .prepare(
+      `SELECT p.*, t.name, t.bh, r.label AS roll_label, r.cut_length
+       FROM placements p
+       JOIN piece_types t ON t.id = p.piece_type_id
+       LEFT JOIN rolls r ON r.id = p.roll_id
+       WHERE p.id = ? AND p.job_id = ?`
+    )
+    .get(pid, jobId);
+  if (!p) return res.status(404).json({ error: '裁片不存在' });
+  if (p.placed && (p.cut_length || 0) > 0 && p.y + p.bh <= p.cut_length) {
+    return res.status(409).json({
+      error: `裁片「${p.name}#${p.seq}」已随卷「${p.roll_label}」切线 ${p.cut_length}mm 裁下，不能移回未排区（裁剪进度不可回退）`,
+      conflicts: [`卷「${p.roll_label}」已裁段 0~${p.cut_length}mm`],
+    });
+  }
   const info = db
     .prepare(
       'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0, unplaced_reason = NULL WHERE id = ? AND job_id = ?'
@@ -449,6 +531,21 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
   const label = `裁片「${placement.name}#${placement.seq}」`;
 
   const raw = req.body ? req.body.rollId : undefined;
+  // 已裁件必用卷不得再改（允许把必用卷设为其当前卷/保持原值的幂等操作）
+  if (placement.placed && placement.roll_id != null) {
+    const cutLine = rollById.get(placement.roll_id)?.cut_length || 0;
+    const isCut = cutLine > 0 && placement.y + placement.bh <= cutLine;
+    if (isCut) {
+      const newId = raw === null || raw === undefined ? null : raw;
+      const same = (newId == null && placement.required_roll_id == null) || Number(newId) === placement.required_roll_id;
+      if (!same) {
+        return res.status(409).json({
+          error: `${label}已随卷「${rollById.get(placement.roll_id).label}」切线 ${cutLine}mm 裁下，必用卷约束不可再修改`,
+          conflicts: [`卷「${rollById.get(placement.roll_id).label}」已裁段 0~${cutLine}mm`],
+        });
+      }
+    }
+  }
   if (raw !== null && raw !== undefined && !Number.isInteger(raw)) {
     return res.status(400).json({ error: 'rollId 必须为卷 id 整数，或用 null 取消必用卷约束' });
   }
@@ -478,6 +575,123 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
     jobId
   );
   res.json(jobState(jobId));
+});
+
+// ---------- 按卷裁剪进度（不可回退） ----------
+
+/**
+ * 确认本卷裁剪切线：body { rollId?, cutLine }（单卷方案可省略 rollId）。
+ * 规则：
+ *  - cutLine 为整数毫米，0 < cutLine ≤ 卷长，且必须严格大于本卷上一切线（只增不减）
+ *  - 切线不能穿过任何已排的未裁件（外接盒横跨切线即视为穿过；边可接触）
+ *  - 必须有至少一件已排件整体落在新切线之前（新增已裁件），否则拒绝
+ * 成功后更新该卷切线，返回完整方案（placements[].cut 标出已裁件）。
+ */
+app.post('/api/jobs/:id/cut', (req, res) => {
+  const jobId = Number(req.params.id);
+  const full = loadFull(jobId);
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  const { rolls, placements } = full;
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
+
+  // ---- 目标卷解析 ----
+  let targetRoll;
+  const bodyRollId = req.body ? req.body.rollId : undefined;
+  if (bodyRollId === undefined || bodyRollId === null) {
+    if (rolls.length !== 1) {
+      return res.status(400).json({
+        error: `该方案有 ${rolls.length} 卷，确认裁剪必须在请求体中指定卷 rollId（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+    targetRoll = rolls[0];
+  } else {
+    if (!Number.isInteger(bodyRollId)) {
+      return res.status(400).json({
+        error: `卷号无效：rollId 必须为系统返回的卷 id 整数（收到 "${bodyRollId}"）`,
+      });
+    }
+    targetRoll = rollById.get(bodyRollId);
+    if (!targetRoll) {
+      return res.status(400).json({
+        error: `目标卷不存在：方案中没有 rollId=${bodyRollId} 的卷（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+  }
+  const prev = targetRoll.cut_length || 0;
+  const cutLine = req.body ? req.body.cutLine : undefined;
+
+  // ---- 切线基本校验 ----
+  if (!Number.isInteger(cutLine)) {
+    return res.status(400).json({ error: '切线必须为整数毫米（请求体字段 cutLine）' });
+  }
+  if (cutLine <= prev) {
+    return res.status(400).json({
+      error:
+        prev === 0
+          ? `切线必须 > 0mm（切线位于卷首 0mm 不会新增已裁件）`
+          : `切线 ${cutLine}mm 必须位于上一切线 ${prev}mm 之后（裁剪进度不可回退）`,
+    });
+  }
+  if (cutLine > targetRoll.length) {
+    return res.status(400).json({
+      error: `切线 ${cutLine}mm 超出卷「${targetRoll.label}」可用长度 ${targetRoll.length}mm`,
+    });
+  }
+
+  const onRoll = placements.filter((p) => p.placed && p.roll_id === targetRoll.id);
+
+  // ---- 切线不能穿过已排的未裁件（已裁件整体在旧切线之前，不可能被穿过） ----
+  const crossing = onRoll.filter((p) => p.y < cutLine && p.y + p.bh > cutLine);
+  if (crossing.length > 0) {
+    return res.status(409).json({
+      error:
+        `切线 ${cutLine}mm 穿过卷「${targetRoll.label}」上 ${crossing.length} 件未裁裁片` +
+        `（裁片外接盒横跨切线；可让切线贴边接触，但不能穿过），已保留原方案`,
+      conflicts: crossing.map((p) => `卷「${targetRoll.label}」裁片「${p.name}#${p.seq}」（${p.y}~${p.y + p.bh}mm）`),
+    });
+  }
+
+  // ---- 必须有新增已裁件 ----
+  const newlyCut = onRoll.filter((p) => p.y + p.bh <= cutLine && p.y + p.bh > prev);
+  if (newlyCut.length === 0) {
+    return res.status(409).json({
+      error:
+        `切线 ${cutLine}mm 之前没有新的已排裁片（本卷上一切线 ${prev}mm，其后至 ${cutLine}mm 之间无整体排入的裁片），` +
+        `未记录裁剪进度，已保留原方案`,
+      conflicts: [],
+    });
+  }
+
+  db.transaction(() => {
+    db.prepare('UPDATE rolls SET cut_length = ? WHERE id = ?').run(cutLine, targetRoll.id);
+    // 新落入已裁段的件同时锁定：与既有锁定语义一致（裁剪本身已不可回退）
+    db.prepare(
+      `UPDATE placements SET locked = 1
+       WHERE roll_id = ? AND placed = 1
+         AND y + (SELECT bh FROM piece_types t WHERE t.id = placements.piece_type_id) <= ?`
+    ).run(targetRoll.id, cutLine);
+    recompute(jobId);
+  })();
+
+  const state = jobState(jobId);
+  res.status(201).json({
+    ...state,
+    rollId: targetRoll.id,
+    cutLine,
+    previousCutLine: prev,
+    newlyCut: newlyCut.map((p) => ({ id: p.id, name: p.name, seq: p.seq, x: p.x, y: p.y, rotation: p.rotation })),
+  });
+});
+
+/** 查询按卷裁剪进度：各卷切线、已裁件清单与汇总计数 */
+app.get('/api/jobs/:id/cutting', (req, res) => {
+  const state = jobState(Number(req.params.id));
+  if (!state) return res.status(404).json({ error: '方案不存在' });
+  res.json({ jobId: state.job.id, ...state.cutting });
 });
 
 // ---------- 错误处理与启动 ----------

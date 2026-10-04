@@ -689,6 +689,264 @@ test('API：旧单卷数据与旧调用方式兼容（无 rolls、move 不带 ro
   })
 );
 
+// ---------------- HTTP API（按卷裁剪进度） ----------------
+
+console.log('HTTP API（按卷裁剪进度）');
+
+/** 创建多卷方案并优化，返回 { jobId, rolls(id->row), placements, call } */
+async function setupCutJob(call) {
+  const cr = await call('POST', '/api/jobs', {
+    name: '裁剪测试',
+    rolls: [
+      { label: 'A卷', width: 1000, length: 5000, defects: [] },
+      { label: 'B卷', width: 1000, length: 300, defects: [] }, // 短卷：只放得下必用 B 的 200 高件，普通块只能去 A 卷
+      { label: 'C卷', width: 1000, length: 5000, defects: [] }, // 用于验证已裁件改必用卷被拦截
+    ],
+    pieces: [
+      { name: '块', vertices: [[0, 0], [500, 0], [500, 400], [0, 400]], quantity: 4, allowRotate: true },
+      { name: '必B', vertices: [[0, 0], [200, 0], [200, 200], [0, 200]], quantity: 1, requiredRoll: 2 },
+    ],
+  });
+  assert.strictEqual(cr.status, 201, JSON.stringify(cr.data));
+  const jobId = cr.data.job.id;
+  const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+  assert.strictEqual(op.status, 200);
+  return { jobId, state: op.data, call };
+}
+
+test('裁剪：确认切线后返回本卷切线与各件已裁状态，进度查询一致', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    // 初始：所有卷切线 0，无已裁件
+    const g0 = await call('GET', `/api/jobs/${jobId}/cutting`);
+    assert.strictEqual(g0.status, 200);
+    assert.strictEqual(g0.data.cutCount, 0);
+    assert(g0.data.rolls.every((r) => r.cutLine === 0 && r.cutCount === 0));
+
+    // A卷前两件 500x400 应排在 (0,0) 与 (500,0)：切线 400 裁下 2 件
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    const cut = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    assert.strictEqual(cut.status, 201, JSON.stringify(cut.data));
+    assert.strictEqual(cut.data.cutLine, 400);
+    assert.strictEqual(cut.data.previousCutLine, 0);
+    assert.strictEqual(cut.data.newlyCut.length, 2);
+    const aRoll = cut.data.rolls.find((r) => r.id === A);
+    assert.strictEqual(aRoll.cutLength, 400);
+    const cutPieces = cut.data.placements.filter((p) => p.cut);
+    assert.strictEqual(cutPieces.length, 2);
+    assert(cutPieces.every((p) => p.rollId === A && p.y + p.bh <= 400));
+    assert(cut.data.placements.filter((p) => p.rollId === A && !p.cut).every((p) => p.y >= 400 || !p.placed));
+
+    // 进度查询接口
+    const g1 = await call('GET', `/api/jobs/${jobId}/cutting`);
+    const a = g1.data.rolls.find((r) => r.rollId === A);
+    assert.strictEqual(a.cutLine, 400);
+    assert.strictEqual(a.cutCount, 2);
+    assert.strictEqual(g1.data.cutCount, 2);
+    const b = g1.data.rolls.find((r) => r.label === 'B卷');
+    assert.strictEqual(b.cutLine, 0);
+  })
+);
+
+test('裁剪：切线可接触裁片边（y+bh=切线）但不能穿过未裁件', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    // 找一件 y 在第二排的件（y=400 起）
+    const row2 = state.placements.find((p) => p.placed && p.rollId === A && p.y === 400);
+    assert(row2, '第二排应有裁片 y=400');
+    // 切线 600 穿过第二排件（400~800）→ 409 且列出穿过件
+    const bad = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 600 });
+    assert.strictEqual(bad.status, 409, JSON.stringify(bad.data));
+    assert(/穿过/.test(bad.data.error));
+    assert(bad.data.conflicts.some((c) => c.includes(row2.name)));
+    // 原方案保持：切线仍为 0
+    const g = await call('GET', `/api/jobs/${jobId}/cutting`);
+    assert.strictEqual(g.data.rolls.find((r) => r.rollId === A).cutLine, 0);
+    // 切线 400 恰好贴第一排件边 → 成功
+    const ok = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    assert.strictEqual(ok.status, 201);
+  })
+);
+
+test('裁剪：无效切线（0、回退、超卷长、非整数、缺卷）被拒且原方案不变', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    const first = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    assert.strictEqual(first.status, 201);
+
+    for (const body of [
+      { rollId: A, cutLine: 400 }, // 等于上一切线（无推进）
+      { rollId: A, cutLine: 100 }, // 回退
+      { rollId: A, cutLine: 0 }, // 卷首
+      { rollId: A, cutLine: 5001 }, // 超卷长
+      { rollId: A, cutLine: 450.5 }, // 非整数
+      { rollId: 9999, cutLine: 500 }, // 未知卷
+      { rollId: A }, // 缺 cutLine
+    ]) {
+      const r = await call('POST', `/api/jobs/${jobId}/cut`, body);
+      assert(r.status === 400, `${JSON.stringify(body)} 应 400，实际 ${r.status}: ${JSON.stringify(r.data)}`);
+    }
+    // 多卷方案省略 rollId 也为 400
+    const noRoll = await call('POST', `/api/jobs/${jobId}/cut`, { cutLine: 800 });
+    assert.strictEqual(noRoll.status, 400);
+    // 切线保持 400
+    const g = await call('GET', `/api/jobs/${jobId}/cutting`);
+    assert.strictEqual(g.data.rolls.find((r) => r.rollId === A).cutLine, 400);
+  })
+);
+
+test('裁剪：切线推进但无新增已裁件（空区间）被拒', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    // 首排件到 400；切线先到 400，再尝试 500（400~500 间无整件）→ 但 500 不穿过第二排件
+    // 第二排 400~800，切线 500 会穿过 → 先移动第二排件腾出空间再测空区间
+    const c1 = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    assert.strictEqual(c1.status, 201);
+    // 把第二排两件移到更后面（y=1000），使 400~700 成为空区间
+    const row2 = c1.data.placements.filter((p) => p.placed && p.rollId === A && p.y === 400);
+    for (let i = 0; i < row2.length; i++) {
+      const mv = await call('POST', `/api/jobs/${jobId}/placements/${row2[i].id}/move`, {
+        rollId: A, x: row2[i].x, y: 1000, rotation: row2[i].rotation,
+      });
+      assert.strictEqual(mv.status, 200, JSON.stringify(mv.data));
+    }
+    const empty = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 700 });
+    assert.strictEqual(empty.status, 409, JSON.stringify(empty.data));
+    assert(/没有新的已排裁片/.test(empty.data.error));
+  })
+);
+
+test('裁剪：已裁件不能移动/移回未排区/改必用卷', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    const C = state.rolls.find((r) => r.label === 'C卷').id;
+    const cut = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    const pc = cut.data.placements.find((p) => p.cut);
+
+    const mv = await call('POST', `/api/jobs/${jobId}/placements/${pc.id}/move`, {
+      rollId: A, x: pc.x + 10, y: pc.y, rotation: 0,
+    });
+    assert.strictEqual(mv.status, 409);
+    assert(/已.*裁/.test(mv.data.error));
+
+    const up = await call('POST', `/api/jobs/${jobId}/placements/${pc.id}/unplace`, {});
+    assert.strictEqual(up.status, 409);
+
+    const rr = await call('POST', `/api/jobs/${jobId}/placements/${pc.id}/require-roll`, { rollId: C });
+    assert.strictEqual(rr.status, 409);
+    // 幂等：保持原必用卷（本来为 null → 仍设 null）不报错
+    const rrSame = await call('POST', `/api/jobs/${jobId}/placements/${pc.id}/require-roll`, { rollId: null });
+    assert.strictEqual(rrSame.status, 200);
+
+    // 位置未被改动
+    const chk = (await call('GET', `/api/jobs/${jobId}`)).data.placements.find((p) => p.id === pc.id);
+    assert.strictEqual(chk.x, pc.x);
+    assert.strictEqual(chk.y, pc.y);
+    assert.strictEqual(chk.rollId, A);
+  })
+);
+
+test('裁剪：手动移动/跨卷调整不能把未裁件放入已裁卷段', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    const c1 = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    assert.strictEqual(c1.status, 201);
+    // 未裁件（第二排）尝试移到切线之前 y=0 → 409
+    const p = c1.data.placements.find((p2) => p2.placed && p2.rollId === A && p2.y >= 400);
+    assert(p, '应有未裁件');
+    const intoCut = await call('POST', `/api/jobs/${jobId}/placements/${p.id}/move`, {
+      rollId: A, x: 0, y: 0, rotation: 0,
+    });
+    assert.strictEqual(intoCut.status, 409, JSON.stringify(intoCut.data));
+    assert(/已裁段/.test(intoCut.data.error));
+    // 压切线（y=300, h=400 → 300~700 穿过 400）→ 409
+    const straddle = await call('POST', `/api/jobs/${jobId}/placements/${p.id}/move`, {
+      rollId: A, x: 0, y: 300, rotation: 0,
+    });
+    assert.strictEqual(straddle.status, 409);
+    // 下沿贴切线 y=400 → 合法（边接触）；目标 x 取其原 x 列以避开其他件
+    const touch = await call('POST', `/api/jobs/${jobId}/placements/${p.id}/move`, {
+      rollId: A, x: p.x, y: 400, rotation: 0,
+    });
+    assert.strictEqual(touch.status, 200, JSON.stringify(touch.data));
+  })
+);
+
+test('裁剪：优化只重排未裁件且本卷未裁件必须在切线之后，已裁件不动', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const A = state.rolls.find((r) => r.label === 'A卷').id;
+    const c1 = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: A, cutLine: 400 });
+    const cutBefore = c1.data.placements.filter((p) => p.cut);
+    assert(cutBefore.length >= 2);
+    const snapshot = new Map(cutBefore.map((p) => [p.id, p]));
+
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.status, 200, JSON.stringify(op.data));
+    // 已裁件卷号/坐标/方向完全不变，仍标 cut
+    for (const p of op.data.placements.filter((p2) => snapshot.has(p2.id))) {
+      const s = snapshot.get(p.id);
+      assert(p.cut, '已裁件仍应标记 cut');
+      assert.strictEqual(p.rollId, s.rollId);
+      assert.strictEqual(p.x, s.x);
+      assert.strictEqual(p.y, s.y);
+      assert.strictEqual(p.rotation, s.rotation);
+    }
+    // A卷上所有未裁已排件 y >= 400
+    for (const p of op.data.placements) {
+      if (p.placed && p.rollId === A && !p.cut) {
+        assert(p.y >= 400, `未裁件 ${p.name}#${p.seq} y=${p.y} 位于切线 400 之前`);
+      }
+    }
+  })
+);
+
+test('裁剪：B卷必用卷件切线独立推进；单卷方案可省略 rollId；切线至卷尾可全裁', () =>
+  withServer(async (call) => {
+    const { jobId, state } = await setupCutJob(call);
+    const B = state.rolls.find((r) => r.label === 'B卷').id;
+    const after = state.placements.find((p) => p.name === '必B');
+    assert.strictEqual(after.rollId, B);
+    const cb = await call('POST', `/api/jobs/${jobId}/cut`, { rollId: B, cutLine: after.y + after.bh });
+    assert.strictEqual(cb.status, 201);
+    assert(cb.data.placements.find((p) => p.id === after.id).cut);
+
+    // 旧单卷方案：省略 rollId 即可裁剪
+    const legacy = await call('POST', '/api/jobs', {
+      name: '旧单卷', fabricWidth: 1000, fabricLength: 3000,
+      pieces: [{ name: 'q', vertices: [[0, 0], [400, 0], [400, 400], [0, 400]], quantity: 1 }],
+    });
+    const jid = legacy.data.job.id;
+    await call('POST', `/api/jobs/${jid}/optimize`);
+    const c = await call('POST', `/api/jobs/${jid}/cut`, { cutLine: 3000 }); // 切线到卷尾
+    assert.strictEqual(c.status, 201, JSON.stringify(c.data));
+    assert.strictEqual(c.data.rolls[0].cutLength, 3000);
+    assert.strictEqual(c.data.placements.filter((p) => p.cut).length, 1);
+    // 切线到卷尾后再推进：无新增件且超出长度，分别被拒
+    const over = await call('POST', `/api/jobs/${jid}/cut`, { cutLine: 3000 });
+    assert.strictEqual(over.status, 400);
+  })
+);
+
+test('裁剪：旧库迁移后 rolls 带 cut_length=0，GET 状态含 cutting 与 placements[].cut 字段', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      name: '字段', fabricWidth: 1000, fabricLength: 1000,
+      pieces: [{ name: 'q', vertices: [[0, 0], [100, 0], [100, 100], [0, 100]], quantity: 1 }],
+    });
+    const s = cr.data;
+    assert(Array.isArray(s.cutting.rolls));
+    assert.strictEqual(s.cutting.rolls[0].cutLine, 0);
+    assert.strictEqual(typeof s.placements[0].cut, 'boolean');
+    assert.strictEqual(s.rolls[0].cutLength, 0);
+  })
+);
+
 runAll().then(() => {
   console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
 });
