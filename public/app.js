@@ -14,6 +14,7 @@ let currentRollId = null;  // 画布当前查看的卷 id
 let drag = null;           // 拖拽状态
 let rollCards = [];        // 新建表单：布卷卡片
 let pieceRows = [];        // 新建表单：裁片卡片
+let cutInputRollId = null; // 切线输入框当前对应的卷（切换卷时重置建议值）
 
 const PALETTE = [
   '#f4a261', '#2a9d8f', '#e9c46a', '#8ab17d', '#577590',
@@ -77,6 +78,7 @@ async function refreshJobList(selectId) {
 async function openJob(id) {
   state = await api('GET', `/api/jobs/${id}`);
   selectedId = null;
+  cutInputRollId = null;
   if (!state.rolls.some((r) => r.id === currentRollId)) {
     currentRollId = state.rolls.length ? state.rolls[0].id : null;
   }
@@ -109,6 +111,8 @@ function fitScale() {
 function renderAll() {
   renderToolbar();
   renderRollTabs();
+  renderCutBar();
+  renderCutPanel();
   renderUnplaced();
   renderSelPanel();
   setupCanvas();
@@ -152,7 +156,11 @@ function renderRollTabs() {
     tab.className = 'rolltab' + (r.id === currentRollId ? ' active' : '');
     tab.innerHTML =
       `${r.seq}. ${r.label} <span class="dim">${r.width}×${r.length}mm</span>` +
-      (r.used ? `<span class="ulen">占用 ${r.usedLength}mm</span>` : '<span class="idle">未启用</span>');
+      (r.cutLine > 0
+        ? `<span class="ulen">✂切线 ${r.cutLine}mm · 已裁 ${r.cutCount} 件</span>`
+        : r.used
+          ? `<span class="ulen">占用 ${r.usedLength}mm</span>`
+          : '<span class="idle">未启用</span>');
     tab.onclick = () => {
       currentRollId = r.id;
       fitScale();
@@ -160,6 +168,68 @@ function renderRollTabs() {
     };
     el.appendChild(tab);
   }
+}
+
+/* ================= 裁剪进度 ================= */
+
+function renderCutBar() {
+  const bar = $('cutBar');
+  if (!state) { bar.className = ''; return; }
+  bar.className = 'show';
+  const r = currentRoll();
+  if (!r) return;
+  const info = $('cutInfo');
+  if (r.cutLine > 0) {
+    info.textContent = `卷「${r.label}」：切线 ${r.cutLine}/${r.length}mm，已裁 ${r.cutCount} 件，剩余 ${r.length - r.cutLine}mm`;
+  } else {
+    info.textContent = `卷「${r.label}」尚未裁剪（卷长 ${r.length}mm）`;
+  }
+  const input = $('cutLineInput');
+  if (cutInputRollId !== r.id) {
+    cutInputRollId = r.id;
+    input.dataset.userEdit = '';
+  }
+  if (input.dataset.userEdit !== '1') {
+    // 默认建议值：当前所有未裁已排件的末端（即“裁到本卷未裁占用末尾”）
+    let suggest = 0;
+    for (const p of state.placements) {
+      if (p.placed && p.rollId === r.id && !p.cut) suggest = Math.max(suggest, p.y + p.bh);
+    }
+    if (suggest <= r.cutLine) suggest = Math.min(r.cutLine + 1, r.length);
+    input.value = suggest;
+    input.min = String(r.cutLine + 1);
+    input.max = String(r.length);
+  }
+}
+
+function renderCutPanel() {
+  const el = $('cutPanel');
+  if (!state) { el.className = ''; el.innerHTML = ''; return; }
+  const cutRolls = (state.cuts || []).filter((c) => c.cutLine > 0);
+  if (cutRolls.length === 0) {
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  el.className = 'show';
+  el.innerHTML = '<b>✂ 已裁布段（不可回退）：</b>';
+  for (const c of cutRolls) {
+    const row = document.createElement('div');
+    row.className = 'cut-roll';
+    const pieces = c.cutPieces
+      .map((p) => `<span class="cchip${p.id === selectedId ? ' sel' : ''}" data-pid="${p.id}" title="(x=${p.x}, y=${p.y}, ${p.rotation}°)">${p.name}#${p.seq}</span>`)
+      .join('');
+    row.innerHTML =
+      `<b>卷「${c.label}」</b>：切线 <span class="cut-now">${c.cutLine}mm</span> / 卷长 ${c.length}mm，已裁 ${c.cutCount} 件：` +
+      (pieces ? pieces : '<span class="cut-none">无</span>');
+    el.appendChild(row);
+  }
+  el.querySelectorAll('.cchip').forEach((chip) => {
+    chip.onclick = () => {
+      selectedId = Number(chip.dataset.pid);
+      renderAll();
+    };
+  });
 }
 
 function renderUnplaced() {
@@ -225,7 +295,8 @@ function renderSelPanel() {
     (p.placed
       ? `卷「${roll.label}」卷内 (${p.x}, ${p.y}) ${p.rotation}°`
       : '<span style="color:#ef6c00">未排入</span>' + (p.reason ? `（${p.reason}）` : '')) +
-    (p.locked ? '　🔒已锁定' : '') +
+    (p.cut ? '　<span style="color:#6a1b9a;font-weight:600">✂已裁（不可再改）</span>' : '') +
+    (!p.cut && p.locked ? '　🔒已锁定' : '') +
     (reqRoll ? `　必用卷：${reqRoll.label}` : '');
   // 目标卷（默认当前所在卷；未排件默认必用卷或当前查看卷）
   const targetRollId = p.rollId || p.requiredRollId || currentRollId;
@@ -237,7 +308,11 @@ function renderSelPanel() {
   // 必用卷选择器
   rollSelectOptions($('selReqRoll'), p.requiredRollId, true);
   $('selLocked').checked = p.locked;
-  $('selLocked').disabled = !p.placed;
+  $('selLocked').disabled = !p.placed || p.cut;
+  // 已裁件：卷号/位置/方向/必用卷均不可再改
+  ['selRoll', 'selX', 'selY', 'selRot', 'selReqRoll', 'btnApplyMove', 'btnUnplace'].forEach((id) => {
+    $(id).disabled = !!p.cut;
+  });
 }
 
 /* ================= 画布 ================= */
@@ -301,6 +376,23 @@ function draw() {
     for (let x = 0; x <= W; x += 500) ctx.fillText(String(x), mmX(x) + 2, mmY(0) - 4);
   }
 
+  // 已裁段阴影（[0,cutLine) 全幅），最先绘制以衬托瑕疵与裁片
+  if (r.cutLine > 0) {
+    ctx.fillStyle = 'rgba(142,36,170,0.14)';
+    ctx.fillRect(mmX(0), mmY(0), W * scale, r.cutLine * scale);
+    ctx.strokeStyle = 'rgba(106,27,154,0.35)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]);
+    const cutStep = 200;
+    for (let x = cutStep; x < W; x += cutStep) {
+      ctx.beginPath();
+      ctx.moveTo(mmX(x), mmY(0));
+      ctx.lineTo(mmX(x), mmY(Math.min(r.cutLine, L)));
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
   // 当前卷瑕疵区
   for (const d of defectsOf(r.id)) {
     ctx.fillStyle = 'rgba(229,57,53,0.30)';
@@ -328,10 +420,10 @@ function draw() {
     ctx.beginPath();
     vs.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(mmX(x), mmY(y)) : ctx.lineTo(mmX(x), mmY(y))));
     ctx.closePath();
-    ctx.fillStyle = typeColor(p.pieceTypeId) + (isDrag ? '99' : 'cc');
+    ctx.fillStyle = typeColor(p.pieceTypeId) + (isDrag ? '99' : p.cut ? '99' : 'cc');
     ctx.fill();
     ctx.lineWidth = p.id === selectedId ? 2.5 : 1;
-    ctx.strokeStyle = p.id === selectedId ? '#0d47a1' : '#444';
+    ctx.strokeStyle = p.id === selectedId ? '#0d47a1' : p.cut ? '#6a1b9a' : '#444';
     if (isDrag) ctx.setLineDash([4, 3]);
     ctx.stroke();
     ctx.setLineDash([]);
@@ -342,13 +434,27 @@ function draw() {
       ctx.fillStyle = '#1a1a1a';
       ctx.font = '11px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(`${p.name}#${p.seq}${p.rotation === 180 ? ' ⟲180°' : ''}`, mmX(cx), mmY(cy) + 4);
+      ctx.fillText(`${p.name}#${p.seq}${p.rotation === 180 ? ' ⟲180°' : ''}${p.cut ? ' ✂' : ''}`, mmX(cx), mmY(cy) + 4);
       ctx.textAlign = 'left';
     }
-    if (p.locked) {
+    if (p.locked && !p.cut) {
       ctx.font = '11px sans-serif';
       ctx.fillText('🔒', mmX(cx) - 6, mmY(cy) - 6);
     }
+  }
+
+  // 当前卷裁切线（不可回退）：紫色实线 + ✂ 标注
+  if (r.cutLine > 0) {
+    ctx.strokeStyle = '#6a1b9a';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(mmX(0), mmY(r.cutLine));
+    ctx.lineTo(mmX(W), mmY(r.cutLine));
+    ctx.stroke();
+    ctx.fillStyle = '#6a1b9a';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText(`✂ 切线 ${r.cutLine}mm（前已裁）`, mmX(4), mmY(r.cutLine) + 15);
   }
 
   // 当前卷实际占用长度线
@@ -402,6 +508,12 @@ cv.addEventListener('mousedown', (e) => {
     if (mx < p.x || mx > p.x + t.bw || my < p.y || my > p.y + t.bh) continue;
     if (!pointInPoly(mx, my, absVertsOf(p))) continue;
     selectedId = p.id;
+    if (p.cut) {
+      // 已裁件：可选中查看，但不可拖拽
+      renderSelPanel();
+      draw();
+      return;
+    }
     drag = {
       pid: p.id,
       locked: p.locked,
@@ -485,6 +597,38 @@ $('btnZoomIn').onclick = () => {
   setupCanvas(); draw();
 };
 $('btnZoomOut').onclick = () => { scale = Math.max(scale / 1.25, 0.005); setupCanvas(); draw(); };
+
+$('cutLineInput').addEventListener('input', () => {
+  $('cutLineInput').dataset.userEdit = '1';
+});
+
+$('btnConfirmCut').onclick = async () => {
+  if (!state) return;
+  const r = currentRoll();
+  if (!r) return;
+  const line = Number($('cutLineInput').value);
+  if (!Number.isInteger(line)) {
+    showMsg('切线必须为整数毫米。', true);
+    return;
+  }
+  if (!window.confirm(
+    `确认在卷「${r.label}」的 ${line}mm 处裁剪？\n` +
+    `裁剪不可回退：切线之前已排的未裁件将全部标记为已裁，此后其卷号、位置、方向与必用卷均不可修改。`
+  )) return;
+  try {
+    const resp = await api('POST', `/api/jobs/${state.job.id}/cuts`, { rollId: r.id, cutLine: line });
+    const n = resp.cut ? resp.cut.newCutCount : 0;
+    state = resp;
+    delete state.cut;
+    showMsg(`已确认卷「${r.label}」切线 ${line}mm：本次新增 ${n} 件已裁，后续优化只会重排切线之后的未裁件。`, false);
+    $('cutLineInput').dataset.userEdit = '';
+    cutInputRollId = null;
+    renderAll();
+  } catch (err) {
+    showApiError(err, '裁剪确认被拒绝，原方案不变');
+    renderAll();
+  }
+};
 
 $('btnApplyMove').onclick = async () => {
   const p = findPlacement(selectedId);

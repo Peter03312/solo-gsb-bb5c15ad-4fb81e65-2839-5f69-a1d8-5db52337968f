@@ -69,7 +69,7 @@
           <button id="btnApplyMove" class="primary">应用位置</button>
           <button id="btnUnplace">移回未排区</button>
         </div>
-        <p class="hint">提示：也可直接在画布上拖动裁片（跨卷请先在上方选目标卷再应用位置；锁定件需先解锁）。</p>
+        <p class="hint">提示：也可直接在画布上拖动裁片（跨卷请先在上方选目标卷再应用位置；锁定件需先解锁）。已裁件（✂）的卷号、位置、方向与必用卷均不可再改。</p>
       </section>
     </aside>
 
@@ -83,6 +83,14 @@
         <button id="btnZoomIn">＋</button>
       </div>
       <div id="rollTabs"></div>
+      <div id="cutBar">
+        <span class="cut-title">✂ 裁剪进度</span>
+        <span id="cutInfo"></span>
+        <label class="cut-input">新切线 <input id="cutLineInput" type="number" step="1" min="1"> mm</label>
+        <button id="btnConfirmCut" class="primary">确认切线（不可回退）</button>
+        <span class="hint">沿当前查看卷的水平方向裁剪；切线前已排裁片将标记为已裁。</span>
+      </div>
+      <div id="cutPanel"></div>
       <div id="msg"></div>
       <div id="unplacedPanel"></div>
       <div id="canvasWrap"><canvas id="cv"></canvas></div>

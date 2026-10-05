@@ -93,3 +93,28 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 #canvasWrap { flex: 1; overflow: auto; margin: 8px 12px 12px; background: #dfe3e6; border: 1px solid #ccc; }
 #cv { display: block; cursor: default; }
+
+/* 裁剪进度 */
+#cutBar {
+  display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 6px 12px 0; padding: 6px 12px; background: #fff; border: 1px solid #b0bec5; border-radius: 6px;
+}
+#cutBar.show { display: flex; }
+#cutBar .cut-title { font-weight: 600; color: #5d4037; white-space: nowrap; }
+#cutInfo { color: #5d4037; font-size: 13px; }
+#cutBar .cut-input { display: flex; align-items: center; gap: 4px; font-size: 13px; color: #555; }
+#cutBar .cut-input input { width: 90px; padding: 4px 6px; }
+
+#cutPanel { display: none; margin: 6px 12px 0; padding: 8px 12px; background: #f3eef7; border: 1px solid #ceb8dd; border-radius: 6px; }
+#cutPanel.show { display: block; }
+#cutPanel .cut-roll { padding: 5px 0; border-bottom: 1px dashed #d5c6e0; font-size: 13px; }
+#cutPanel .cut-roll:last-child { border-bottom: none; }
+#cutPanel .cut-roll b { color: #4a148c; }
+#cutPanel .cut-now { color: #6a1b9a; }
+#cutPanel .cut-none { color: #999; }
+#cutPanel .cchip {
+  display: inline-block; margin: 2px 4px 0 0; padding: 1px 8px;
+  background: #fff; border: 1px solid #8e24aa; border-radius: 10px; font-size: 12px; cursor: pointer;
+}
+#cutPanel .cchip:hover { background: #f3e5f5; }
+#cutPanel .cchip.sel { background: #8e24aa; color: #fff; }

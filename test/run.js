@@ -689,6 +689,246 @@ test('API：旧单卷数据与旧调用方式兼容（无 rolls、move 不带 ro
   })
 );
 
+// ---------------- 裁剪进度（按卷逐段，不可回退） ----------------
+
+console.log('裁剪进度 API');
+
+test('API：切线校验——非整数/非正/超卷长/穿过裁片/无效卷均拒绝且方案不变', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 5000 }, { label: 'B', width: 1000, length: 4000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 500, 500), quantity: 4 }],
+    });
+    const jobId = cr.data.job.id;
+    const A = cr.data.rolls[0].id;
+    const B = cr.data.rolls[1].id;
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.data.unplaced.length, 0);
+    // 500x500 在 1000 宽卷每行两件：件集中在其中一卷
+    const usedRollId = op.data.placements[0].rollId;
+    const usedRoll = cr.data.rolls.find((r) => r.id === usedRollId);
+
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: usedRollId, cutLine: 400.5 })).status, 400);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: usedRollId, cutLine: '300' })).status, 400);
+    let r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: usedRollId, cutLine: 0 });
+    assert.strictEqual(r.status, 409);
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: usedRollId, cutLine: usedRoll.length + 1 });
+    assert.strictEqual(r.status, 409);
+    assert(new RegExp(`超出卷「${usedRoll.label}」可用长度`).test(r.data.error));
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: 99999, cutLine: 500 });
+    assert.strictEqual(r.status, 400);
+    // 多卷省略 rollId → 400
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { cutLine: 500 });
+    assert.strictEqual(r.status, 400);
+
+    // 切线 300 穿过该卷 y0~500 的件
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: usedRollId, cutLine: 300 });
+    assert.strictEqual(r.status, 409);
+    assert(/穿过/.test(r.data.error));
+    assert(r.data.conflicts.length >= 1);
+
+    // 全部被拒后方案无任何裁剪进度
+    const q = await call('GET', `/api/jobs/${jobId}/cuts`);
+    assert(q.data.cuts.every((c) => c.cutLine === 0 && c.cutCount === 0));
+  })
+);
+
+test('API：确认切线后返回切线与各件已裁状态；无新增件/回退/重复均拒绝', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 4000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 500, 500), quantity: 3 }],
+    });
+    const jobId = cr.data.job.id;
+    const A = cr.data.rolls[0].id;
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    // 布局：两件在 y0~500，一件在 y500~1000
+    const first = op.data.placements.filter((p) => p.y === 0).map((p) => p.id).sort((a, b) => a - b);
+    assert.strictEqual(first.length, 2);
+
+    // 单卷可省略 rollId
+    let r = await call('POST', `/api/jobs/${jobId}/cuts`, { cutLine: 500 });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+    assert.strictEqual(r.data.cut.cutLine, 500);
+    assert.deepStrictEqual(r.data.cut.newCutPieceIds, first);
+    assert.strictEqual(r.data.rolls[0].cutLine, 500);
+    assert.strictEqual(r.data.rolls[0].cutCount, 2);
+    for (const p of r.data.placements) {
+      assert.strictEqual(p.cut, first.includes(p.id));
+    }
+
+    // 查询接口
+    const q = await call('GET', `/api/jobs/${jobId}/cuts`);
+    assert.strictEqual(q.data.cuts.length, 1);
+    assert.strictEqual(q.data.cuts[0].cutLine, 500);
+    assert.strictEqual(q.data.cuts[0].cutPieces.length, 2);
+    assert(q.data.cuts[0].cutPieces.every((p) => p.y < 500));
+
+    // 相同切线/回退 → 409
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 500 })).status, 409);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 499 })).status, 409);
+
+    // 切线 700 穿过第三件（y500~1000）→ 409 且进度不变
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 700 });
+    assert.strictEqual(r.status, 409);
+    assert(/穿过/.test(r.data.error));
+
+    // 推进到 1000：第三件新增已裁
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 1000 });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.data.cut.newCutCount, 1);
+    assert.strictEqual(r.data.rolls[0].cutCount, 3);
+
+    // 再往前切但无新增件 → 409
+    r = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 1200 });
+    assert.strictEqual(r.status, 409);
+    assert(/没有新增已裁件/.test(r.data.error));
+  })
+);
+
+test('API：已裁件卷号/位置/方向/必用卷不可改，不能移回未排区或解锁', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 4000 }, { label: 'B', width: 1000, length: 4000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 300, 300), quantity: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    const A = cr.data.rolls[0].id;
+    const B = cr.data.rolls[1].id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    const cut = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 300 });
+    const cutPiece = cut.data.placements.find((p) => p.cut);
+    assert(cutPiece, '应至少有一件已裁');
+
+    let r = await call('POST', `/api/jobs/${jobId}/placements/${cutPiece.id}/move`, { rollId: A, x: 10, y: 10, rotation: 0 });
+    assert.strictEqual(r.status, 409);
+    r = await call('POST', `/api/jobs/${jobId}/placements/${cutPiece.id}/move`, { rollId: B, x: 0, y: 0, rotation: 0 });
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/placements/${cutPiece.id}/unplace`)).status, 409);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/placements/${cutPiece.id}/lock`, { locked: true })).status, 409);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/placements/${cutPiece.id}/lock`, { locked: false })).status, 409);
+    r = await call('POST', `/api/jobs/${jobId}/placements/${cutPiece.id}/require-roll`, { rollId: B });
+    assert.strictEqual(r.status, 409);
+
+    // 方案状态确认：已裁件仍在原位原卷
+    const st = await call('GET', `/api/jobs/${jobId}`);
+    const p = st.data.placements.find((x) => x.id === cutPiece.id);
+    assert(p.placed && p.cut && p.rollId === A);
+    assert.strictEqual(p.x, cutPiece.x);
+    assert.strictEqual(p.y, cutPiece.y);
+  })
+);
+
+test('API：手动移动/跨卷调整不得把未裁件放入已裁段；边接触切线允许', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 4000 }, { label: 'B', width: 1000, length: 4000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 500, 300), quantity: 4 }],
+    });
+    const jobId = cr.data.job.id;
+    const A = cr.data.rolls[0].id;
+    const B = cr.data.rolls[1].id;
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    // 全部排在 A：y0 两件、y300 两件。切 300 裁下前两件
+    await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 300 });
+    const unc = op.data.placements.find((p) => p.y === 300);
+
+    // 进入已裁段内部 → 409
+    let r = await call('POST', `/api/jobs/${jobId}/placements/${unc.id}/move`, { rollId: A, x: 0, y: 0, rotation: 0 });
+    assert.strictEqual(r.status, 409);
+    assert(/已裁段/.test(r.data.error));
+
+    // 边接触切线 y=300 → 200
+    r = await call('POST', `/api/jobs/${jobId}/placements/${unc.id}/move`, { rollId: A, x: 0, y: 300, rotation: 0 });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.data));
+
+    // 跨卷到未裁剪的 B 卷 → 200
+    r = await call('POST', `/api/jobs/${jobId}/placements/${unc.id}/move`, { rollId: B, x: 0, y: 0, rotation: 0 });
+    assert.strictEqual(r.status, 200);
+  })
+);
+
+test('API：优化只重排未裁件——已裁件固定，未裁件在本卷必位于切线之后', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: 'A', width: 1000, length: 4000 }, { label: 'B', width: 1000, length: 4000 }],
+      pieces: [{ name: '块', vertices: rect(0, 0, 500, 300), quantity: 6 }],
+    });
+    const jobId = cr.data.job.id;
+    const A = cr.data.rolls[0].id;
+    const B = cr.data.rolls[1].id;
+    let op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.data.unplaced.length, 0);
+    // 切线 300 裁下 A 卷 y0 行的两件（若优化器全集中到一卷）
+    const cut = await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: A, cutLine: 300 });
+    if (cut.status !== 200) {
+      // 布局可能与预期不同：确保至少有一件在 A 卷 y0 行再裁剪——用返回成功的最小可行切线
+      assert.fail('前置布局异常：A 卷切线 300 未能裁下任何件');
+    }
+    const cutIds = new Set(cut.data.cut.newCutPieceIds);
+    const before = new Map(cut.data.placements.filter((p) => cutIds.has(p.id)).map((p) => [p.id, p]));
+
+    op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    assert.strictEqual(op.data.unplaced.length, 0, op.data.unplaced.map((u) => u.reason).join('；'));
+    for (const p of op.data.placements) {
+      if (cutIds.has(p.id)) {
+        const b = before.get(p.id);
+        assert(p.cut && p.rollId === b.rollId && p.x === b.x && p.y === b.y && p.rotation === b.rotation, '已裁件必须保持原位原卷原方向');
+      } else if (p.placed && p.rollId === A) {
+        assert(p.y >= 300, `未裁件在 A 卷必须位于切线之后（y=${p.y}）`);
+      }
+    }
+  })
+);
+
+test('API：切线后剩余长度容不下裁片时设置必用卷被拒绝', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      rolls: [{ label: '短卷', width: 1000, length: 600 }, { label: '长卷', width: 1000, length: 5000 }],
+      pieces: [
+        { name: '垫底', vertices: rect(0, 0, 500, 400), quantity: 1 },
+        { name: '活动', vertices: rect(0, 0, 500, 300), quantity: 1 },
+      ],
+    });
+    const jobId = cr.data.job.id;
+    const short = cr.data.rolls[0].id;
+    const long = cr.data.rolls[1].id;
+    const op = await call('POST', `/api/jobs/${jobId}/optimize`);
+    const filler = op.data.placements.find((p) => p.name === '垫底');
+    const mover = op.data.placements.find((p) => p.name === '活动');
+    // 垫底件放短卷 y0，活动件放长卷，再裁短卷 400
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/placements/${filler.id}/move`, { rollId: short, x: 0, y: 0, rotation: 0 })).status, 200);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/placements/${mover.id}/move`, { rollId: long, x: 0, y: 0, rotation: 0 })).status, 200);
+    assert.strictEqual((await call('POST', `/api/jobs/${jobId}/cuts`, { rollId: short, cutLine: 400 })).status, 200);
+    // 活动件（500x300）必用短卷：切线后仅剩 200mm → 400
+    const r = await call('POST', `/api/jobs/${jobId}/placements/${mover.id}/require-roll`, { rollId: short });
+    assert.strictEqual(r.status, 400);
+    assert(/切线后剩余长度/.test(r.data.error));
+  })
+);
+
+test('API：裁剪进度在 GET 详情与旧字段中同时可用且不破坏原字段', () =>
+  withServer(async (call) => {
+    const cr = await call('POST', '/api/jobs', {
+      name: '旧', fabricWidth: 1200, fabricLength: 3000,
+      defects: [{ x: 0, y: 0, w: 10, h: 10 }],
+      pieces: [{ name: 'q', vertices: rect(0, 0, 200, 200), quantity: 2 }],
+    });
+    const jobId = cr.data.job.id;
+    await call('POST', `/api/jobs/${jobId}/optimize`);
+    const cut = await call('POST', `/api/jobs/${jobId}/cuts`, { cutLine: 200 });
+    assert.strictEqual(cut.status, 200);
+    // 旧字段仍在
+    assert.strictEqual(cut.data.job.fabricWidth, 1200);
+    assert.strictEqual(cut.data.defects.length, 1);
+    assert.strictEqual(typeof cut.data.placements[0].x, 'number');
+    // 新字段
+    assert.strictEqual(cut.data.rolls[0].cutLine, 200);
+    assert.strictEqual(cut.data.cuts[0].cutLine, 200);
+    assert(cut.data.placements.some((p) => p.cut === true));
+  })
+);
+
 runAll().then(() => {
   console.log(`\n${passed} 项测试${process.exitCode ? '，存在失败' : '全部通过'}。`);
 });

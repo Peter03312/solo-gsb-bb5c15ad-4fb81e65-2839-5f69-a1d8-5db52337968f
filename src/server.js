@@ -73,6 +73,10 @@ function jobState(jobId) {
   const full = loadFull(jobId);
   if (!full) return null;
   const { job, rolls, defects, types, placements } = full;
+  const cutCountByRoll = new Map(rolls.map((r) => [r.id, 0]));
+  for (const p of placements) {
+    if (p.placed && p.cut) cutCountByRoll.set(p.roll_id, (cutCountByRoll.get(p.roll_id) || 0) + 1);
+  }
   const rollList = rolls.map((r) => ({
     id: r.id,
     seq: r.seq,
@@ -81,6 +85,8 @@ function jobState(jobId) {
     length: r.length,
     used: !!r.used,
     usedLength: r.used_length,
+    cutLine: r.cut_line,               // 本卷切线（mm）：[0,cutLine) 已裁；0=尚未裁剪
+    cutCount: cutCountByRoll.get(r.id) || 0,
   }));
   const firstRoll = rolls[0] || null;
   return {
@@ -126,6 +132,7 @@ function jobState(jobId) {
       rotation: p.rotation,
       placed: !!p.placed,
       locked: !!p.locked,
+      cut: !!p.cut,
       allowRotate: !!p.allow_rotate,
       bw: p.bw,
       bh: p.bh,
@@ -140,7 +147,34 @@ function jobState(jobId) {
         rollId: p.required_roll_id,
         reason: p.unplaced_reason || null,
       })),
+    // 裁剪进度（按卷；未裁剪的卷 cutLine=0、cutPieces=[]，同样列出）
+    cuts: cutSummary(rolls, placements),
   };
+}
+
+/** 组装裁剪进度：每卷切线 + 本卷已裁件（按 y、id 排序）。 */
+function cutSummary(rolls, placements) {
+  return rolls.map((r) => ({
+    rollId: r.id,
+    seq: r.seq,
+    label: r.label,
+    width: r.width,
+    length: r.length,
+    cutLine: r.cut_line,                       // 本卷切线（mm），0=尚未裁剪
+    cutCount: placements.filter((p) => p.placed && p.cut && p.roll_id === r.id).length,
+    cutPieces: placements
+      .filter((p) => p.placed && p.cut && p.roll_id === r.id)
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        seq: p.seq,
+        x: p.x,
+        y: p.y,
+        rotation: p.rotation,
+        requiredRollId: p.required_roll_id,
+      }))
+      .sort((a, b) => a.y - b.y || a.id - b.id),
+  }));
 }
 
 // ---------- 路由 ----------
@@ -209,7 +243,9 @@ app.delete('/api/jobs/:id', (req, res) => {
 });
 
 /**
- * 优化排样（多卷）：锁定件与各卷瑕疵固定，重新排入全部未锁定裁片。
+ * 优化排样（多卷）：锁定件、已裁件与各卷瑕疵固定，重新排入其余未裁裁片。
+ * 每卷切线之前的布段 [0, cutLine) 已不可回退地裁下：作为全幅矩形障碍带参与排样，
+ * 故所有未裁件在本卷只能位于切线之后（y ≥ cutLine，边接触允许）。
  * 目标：先尽量排入全部裁片，再减少启用卷数、再减少总占用长度（见 nest.optimizeRolls）。
  */
 app.post('/api/jobs/:id/optimize', (req, res) => {
@@ -219,15 +255,20 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
   const rollIndexById = new Map(rolls.map((r, i) => [r.id, i]));
   const typeById = new Map(types.map((t) => [t.id, t]));
 
-  const locked = placements.filter((p) => p.placed && p.locked);
-  const rest = placements.filter((p) => !(p.placed && p.locked));
+  // 已裁件与锁定件一样固定不动（已裁件同时位于已裁段障碍带内）
+  const locked = placements.filter((p) => p.placed && (p.locked || p.cut));
+  const rest = placements.filter((p) => !(p.placed && (p.locked || p.cut)));
 
   const result = optimizeRolls({
     rolls: rolls.map((r) => ({
       label: r.label,
       W: r.width,
       L: r.length,
-      defects: defects.filter((d) => d.roll_id === r.id),
+      // 已裁段视为全幅障碍矩形：未裁件不得进入 [0, cutLine)
+      defects: [
+        ...(r.cut_line > 0 ? [{ x: 0, y: 0, w: r.width, h: r.cut_line }] : []),
+        ...defects.filter((d) => d.roll_id === r.id),
+      ],
     })),
     locked: locked.map((p) => {
       const t = typeById.get(p.piece_type_id);
@@ -261,21 +302,32 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
   const lockedIds = new Set(locked.map((p) => p.id));
   const placedById = new Map(result.placements.map((pl) => [pl.key, pl]));
   const reasonById = new Map(result.unplaced.map((u) => [u.key, u.reason]));
+  const cutLineByRollId = new Map(rolls.map((r) => [r.id, r.cut_line]));
+  const placeById = new Map(placements.map((p) => [p.id, p]));
+  // 优化器不感知“已裁段”语义，在必用卷未排入原因中补充切线后剩余长度信息
+  const augmentReason = (pid, reason) => {
+    const p = placeById.get(pid);
+    if (!p || p.required_roll_id == null) return reason;
+    const cutLine = cutLineByRollId.get(p.required_roll_id) || 0;
+    if (cutLine <= 0) return reason;
+    const r = rolls[rollIndexById.get(p.required_roll_id)];
+    return `${reason}；该卷切线 ${cutLine}mm 之前已裁，未裁件只能排在切线之后（剩余可用长度 ${r.length - cutLine}mm）`;
+  };
   const upd = db.prepare(
-    'UPDATE placements SET roll_id = ?, x = ?, y = ?, rotation = ?, placed = 1, locked = 0, unplaced_reason = NULL WHERE id = ?'
+    'UPDATE placements SET roll_id = ?, x = ?, y = ?, rotation = ?, placed = 1, unplaced_reason = NULL WHERE id = ?'
   );
   const clr = db.prepare(
-    'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0, unplaced_reason = ? WHERE id = ?'
+    'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, unplaced_reason = ? WHERE id = ?'
   );
   const tx = db.transaction(() => {
     for (const pl of result.placements) {
-      if (lockedIds.has(pl.key)) continue; // 锁定件保持不动（含卷号与位置）
+      if (lockedIds.has(pl.key)) continue; // 锁定件/已裁件保持不动（含卷号与位置）
       upd.run(rolls[pl.rollIndex].id, pl.x, pl.y, pl.rotation, pl.key);
     }
     for (const [key, reason] of reasonById) {
-      clr.run(reason, key);
+      clr.run(augmentReason(key, reason), key);
     }
-    // 保险：结果中未出现且非锁定的件（理论上不存在）也清回未排区
+    // 保险：结果中未出现且非固定的件（理论上不存在）也清回未排区
     for (const p of rest) {
       if (!placedById.has(p.id) && !reasonById.has(p.id)) {
         clr.run('优化器未能排入', p.id);
@@ -291,6 +343,7 @@ app.post('/api/jobs/:id/optimize', (req, res) => {
  * 手动移动 / 旋转 / 手动排入（可跨卷）：
  *  - body.rollId 指定目标卷；省略时单卷方案=唯一卷，多卷方案=保持原卷
  *  - 必用卷约束：目标卷必须等于必用卷
+ *  - 已裁件的卷号/位置/方向不可再改；未裁件不得进入目标卷已裁段（y ≥ 该卷切线）
  *  - 按目标卷布边、瑕疵及已排裁片精确校验；冲突时指出对象且原方案不变
  *  - 锁定件须先解锁
  */
@@ -305,6 +358,12 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
   const label = `裁片「${placement.name}#${placement.seq}」`;
 
+  if (placement.cut) {
+    return res.status(409).json({
+      error: `${label}已随切线前布段裁下，卷号、位置、方向均不可再改，也不能移回未排区`,
+      conflicts: [label + '（已裁）'],
+    });
+  }
   if (placement.locked) {
     return res.status(409).json({ error: `${label}已锁定，请先解锁再移动`, conflicts: [label] });
   }
@@ -369,6 +428,16 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
     });
   }
 
+  // ---- 已裁段边界：未裁件不得进入目标卷切线之前（边接触 y == cutLine 允许） ----
+  if (targetRoll.cut_line > 0 && y < targetRoll.cut_line) {
+    return res.status(409).json({
+      error:
+        `${label}不能放入卷「${targetRoll.label}」的已裁段` +
+        `（该卷切线为 ${targetRoll.cut_line}mm，未裁件须满足 y≥${targetRoll.cut_line}，边接触允许），已保留原方案`,
+      conflicts: [`卷「${targetRoll.label}」已裁段 [0, ${targetRoll.cut_line}mm)`],
+    });
+  }
+
   const type = types.find((t) => t.id === placement.piece_type_id);
   const verts = JSON.parse(type.vertices);
   const abs = geom.toAbsolute(verts, rotation, w, h, x, y);
@@ -384,7 +453,8 @@ app.post('/api/jobs/:id/placements/:pid/move', (req, res) => {
     const qt = types.find((t) => t.id === q.piece_type_id);
     const qAbs = geom.toAbsolute(JSON.parse(qt.vertices), q.rotation, qt.bw, qt.bh, q.x, q.y);
     if (geom.polygonsInteriorOverlap(abs, qAbs)) {
-      conflicts.push(`卷「${targetRoll.label}」裁片「${q.name}#${q.seq}」${q.locked ? '（已锁定）' : ''}`);
+      const tag = q.cut ? '（已裁）' : q.locked ? '（已锁定）' : '';
+      conflicts.push(`卷「${targetRoll.label}」裁片「${q.name}#${q.seq}」${tag}`);
     }
   }
   if (conflicts.length > 0) {
@@ -409,6 +479,10 @@ app.post('/api/jobs/:id/placements/:pid/lock', (req, res) => {
     )
     .get(pid, jobId);
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
+  const label = `裁片「${placement.name}#${placement.seq}」`;
+  if (placement.cut) {
+    return res.status(409).json({ error: `${label}已裁剪，其卷号与位置已不可回退，无需也不能再更改锁定状态`, conflicts: [label + '（已裁）'] });
+  }
   const locked = !!(req.body && req.body.locked);
   if (locked && !placement.placed) {
     return res.status(400).json({ error: `裁片「${placement.name}#${placement.seq}」尚未排入，不能锁定` });
@@ -417,16 +491,25 @@ app.post('/api/jobs/:id/placements/:pid/lock', (req, res) => {
   res.json(jobState(jobId));
 });
 
-/** 移回未排区（同时解除锁定；保留必用卷约束） */
+/** 移回未排区（同时解除锁定；保留必用卷约束；已裁件不可移回） */
 app.post('/api/jobs/:id/placements/:pid/unplace', (req, res) => {
   const jobId = Number(req.params.id);
   const pid = Number(req.params.pid);
-  const info = db
+  const placement = db
+    .prepare('SELECT p.*, t.name FROM placements p JOIN piece_types t ON t.id = p.piece_type_id WHERE p.id = ? AND p.job_id = ?')
+    .get(pid, jobId);
+  if (!placement) return res.status(404).json({ error: '裁片不存在' });
+  if (placement.cut) {
+    return res.status(409).json({
+      error: `裁片「${placement.name}#${placement.seq}」已随切线前布段裁下，不能移回未排区`,
+      conflicts: [`裁片「${placement.name}#${placement.seq}」（已裁）`],
+    });
+  }
+  db
     .prepare(
       'UPDATE placements SET x = NULL, y = NULL, rotation = 0, placed = 0, locked = 0, unplaced_reason = NULL WHERE id = ? AND job_id = ?'
     )
     .run(pid, jobId);
-  if (info.changes === 0) return res.status(404).json({ error: '裁片不存在' });
   recompute(jobId);
   res.json(jobState(jobId));
 });
@@ -436,6 +519,7 @@ app.post('/api/jobs/:id/placements/:pid/unplace', (req, res) => {
  * body: { rollId } 指定必用卷（id 整数）；{ rollId: null } 取消。
  * 无效卷号、宽度/长度容不下裁片的必用卷约束一律拒绝（400）。
  * 已排入件的卷不会因此自动改变；已锁定件同样只改约束，需重新优化/手动移动才生效。
+ * 已裁件的必用卷不可再改；目标卷切线后剩余长度容不下裁片时同样拒绝。
  */
 app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
   const jobId = Number(req.params.id);
@@ -447,6 +531,13 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
   const placement = placements.find((p) => p.id === pid);
   if (!placement) return res.status(404).json({ error: '裁片不存在' });
   const label = `裁片「${placement.name}#${placement.seq}」`;
+
+  if (placement.cut) {
+    return res.status(409).json({
+      error: `${label}已随切线前布段裁下，必用卷不可再改`,
+      conflicts: [label + '（已裁）'],
+    });
+  }
 
   const raw = req.body ? req.body.rollId : undefined;
   if (raw !== null && raw !== undefined && !Number.isInteger(raw)) {
@@ -469,6 +560,15 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
           `（${target.width}×${target.length}mm），必用卷约束不可能满足，已拒绝`,
       });
     }
+    // 该卷已有切线时，未裁件只能使用切线之后的剩余段
+    const remain = target.length - (target.cut_line || 0);
+    if (placement.bh > remain) {
+      return res.status(400).json({
+        error:
+          `${label}外接长度 ${placement.bh}mm 超过必用卷「${target.label}」切线后剩余长度` +
+          `（切线 ${target.cut_line}mm，剩余 ${remain}mm），必用卷约束不可能满足，已拒绝`,
+      });
+    }
   }
 
   // 仅作用于这一件裁片（创建时按型号统一设置；创建后每件可单独调整）
@@ -478,6 +578,126 @@ app.post('/api/jobs/:id/placements/:pid/require-roll', (req, res) => {
     jobId
   );
   res.json(jobState(jobId));
+});
+
+// ---------- 裁剪进度（按卷逐段，不可回退） ----------
+
+/** 查询裁剪进度：各卷切线与已裁件清单 */
+app.get('/api/jobs/:id/cuts', (req, res) => {
+  const full = loadFull(Number(req.params.id));
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  res.json({ job: { id: full.job.id, name: full.job.name }, cuts: cutSummary(full.rolls, full.placements) });
+});
+
+/**
+ * 确认一卷的裁剪切线（不可回退）。
+ * body: { rollId, cutLine }（cutLine 单位 mm，整数；单卷方案可省略 rollId；cutLine 也可用别名 y）。
+ * 规则：
+ *  - 切线必须为整数毫米、大于上一切线、不超过卷长；
+ *  - 切线不得穿过任何已排的未裁件（未裁件整件位于切线之后才合法，边接触允许）；
+ *  - 必须至少有一件已排未裁件整体位于切线之前（无新增已裁件视为无效操作）。
+ * 确认后：本卷切线推进，切线之前的已排件全部标记为已裁；其卷号/位置/方向/必用卷此后不可再改。
+ * 任一规则不满足：说明原因、返回 400/409 且原方案完全不变。
+ */
+app.post('/api/jobs/:id/cuts', (req, res) => {
+  const jobId = Number(req.params.id);
+  const full = loadFull(jobId);
+  if (!full) return res.status(404).json({ error: '方案不存在' });
+  const { rolls, types, placements } = full;
+  const rollById = new Map(rolls.map((r) => [r.id, r]));
+
+  // ---- 目标卷解析（与 move 相同的省略规则） ----
+  let roll;
+  const bodyRollId = req.body ? req.body.rollId : undefined;
+  if (bodyRollId === undefined || bodyRollId === null) {
+    if (rolls.length === 1) roll = rolls[0];
+    else {
+      return res.status(400).json({
+        error: `该方案有 ${rolls.length} 卷，确认裁剪必须指定卷 rollId（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+  } else {
+    if (!Number.isInteger(bodyRollId)) {
+      return res.status(400).json({ error: `卷号无效：rollId 必须为卷 id 整数（收到 "${bodyRollId}"）` });
+    }
+    roll = rollById.get(bodyRollId);
+    if (!roll) {
+      return res.status(400).json({
+        error: `卷不存在：方案中没有 rollId=${bodyRollId} 的卷（可用卷：${rolls
+          .map((r) => `${r.id}=${r.label}`)
+          .join('、')}）`,
+      });
+    }
+  }
+
+  const cutLine = req.body && req.body.cutLine !== undefined ? req.body.cutLine : req.body ? req.body.y : undefined;
+  if (!Number.isInteger(cutLine)) {
+    return res.status(400).json({ error: '切线必须为整数毫米（字段 cutLine，单位 mm）' });
+  }
+  if (cutLine <= roll.cut_line) {
+    return res.status(409).json({
+      error:
+        roll.cut_line > 0
+          ? `切线 ${cutLine}mm 无效：必须严格位于上一切线 ${roll.cut_line}mm 之后（裁剪进度不可回退），原方案不变`
+          : `切线 ${cutLine}mm 无效：必须为正整数（首条切线应 ≥1mm），原方案不变`,
+    });
+  }
+  if (cutLine > roll.length) {
+    return res.status(409).json({
+      error: `切线 ${cutLine}mm 超出卷「${roll.label}」可用长度 ${roll.length}mm，原方案不变`,
+    });
+  }
+
+  const onRoll = placements.filter((p) => p.placed && p.roll_id === roll.id);
+  const straddlers = [];
+  const newlyCut = [];
+  for (const p of onRoll) {
+    if (p.cut) continue; // 已裁件必然位于旧切线之前，跳过
+    // 归一化轮廓的外接矩形即 [0,bw]×[0,bh]；未裁件整体位于切线之后 ⇔ y ≥ cutLine（边接触允许）
+    if (p.y < cutLine) {
+      if (p.y + p.bh <= cutLine) {
+        newlyCut.push(p); // 整件在切线之前，随本段裁下
+      } else {
+        straddlers.push(p); // 穿过切线：y < cutLine < y+bh
+      }
+    }
+  }
+
+  if (straddlers.length > 0) {
+    return res.status(409).json({
+      error:
+        `切线 ${cutLine}mm 穿过卷「${roll.label}」上 ${straddlers.length} 件未裁裁片` +
+        `（裁片须整体位于切线之前或之后，边接触允许），已保留原方案`,
+      conflicts: straddlers.map((p) => `裁片「${p.name}#${p.seq}」（y ${p.y}~${p.y + p.bh}mm）`),
+    });
+  }
+  if (newlyCut.length === 0) {
+    return res.status(409).json({
+      error:
+        `切线 ${cutLine}mm 处没有新增已裁件（上一切线 ${roll.cut_line}mm 之后无整件位于该线之前的已排裁片），` +
+        `确认裁剪不会产生任何进度，已保留原方案`,
+    });
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE rolls SET cut_line = ? WHERE id = ?').run(cutLine, roll.id);
+    const mark = db.prepare('UPDATE placements SET cut = 1 WHERE id = ?');
+    for (const p of newlyCut) mark.run(p.id);
+  });
+  tx();
+  // 切线只记录裁剪进度，不改变卷占用/方案状态，无需 recompute
+  const state = jobState(jobId);
+  state.cut = {
+    rollId: roll.id,
+    label: roll.label,
+    previousCutLine: roll.cut_line,
+    cutLine,
+    newCutPieceIds: newlyCut.map((p) => p.id),
+    newCutCount: newlyCut.length,
+  };
+  res.json(state);
 });
 
 // ---------- 错误处理与启动 ----------

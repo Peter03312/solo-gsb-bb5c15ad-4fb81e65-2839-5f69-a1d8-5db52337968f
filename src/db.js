@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS rolls (
   width       INTEGER NOT NULL,    -- 该卷布幅宽度 mm
   length      INTEGER NOT NULL,    -- 该卷可用长度 mm
   used        INTEGER NOT NULL DEFAULT 0,        -- 是否有裁片排入（启用）
-  used_length INTEGER NOT NULL DEFAULT 0         -- 该卷实际占用长度
+  used_length INTEGER NOT NULL DEFAULT 0,        -- 该卷实际占用长度
+  cut_line    INTEGER NOT NULL DEFAULT 0         -- 本卷裁剪切线（mm）：[0,cut_line) 段已裁，不可回退；只增不减
 );
 
 CREATE TABLE IF NOT EXISTS defects (
@@ -61,7 +62,8 @@ CREATE TABLE IF NOT EXISTS placements (
   rotation INTEGER NOT NULL DEFAULT 0,     -- 0 | 180
   placed   INTEGER NOT NULL DEFAULT 0,
   locked   INTEGER NOT NULL DEFAULT 0,
-  unplaced_reason TEXT                     -- 未排入原因
+  cut      INTEGER NOT NULL DEFAULT 0,           -- 已裁标记（已随切线前布段裁下）：卷号/位置/方向/必用卷均不可再改
+  unplaced_reason TEXT                         -- 未排入原因
 );
 `);
 
@@ -94,6 +96,12 @@ if (!hasColumn('placements', 'required_roll_id')) {
 }
 if (!hasColumn('placements', 'unplaced_reason')) {
   db.exec('ALTER TABLE placements ADD COLUMN unplaced_reason TEXT');
+}
+if (!hasColumn('placements', 'cut')) {
+  db.exec('ALTER TABLE placements ADD COLUMN cut INTEGER NOT NULL DEFAULT 0');
+}
+if (!hasColumn('rolls', 'cut_line')) {
+  db.exec('ALTER TABLE rolls ADD COLUMN cut_line INTEGER NOT NULL DEFAULT 0');
 }
 
 // 旧单卷方案：为每个无卷记录的方案补一卷「默认卷」，并把瑕疵与裁片挂到该卷
